@@ -1,0 +1,100 @@
+# Rescue Town iOS derleyici (herkese açık depo: macOS dakikaları ücretsiz).
+# Unity'nin Xcode projesi ŞİFRELİ olarak bu deponun bir sürümüne yüklenir (AES-256-CBC, PBKDF2; parola PAKET_PAROLA gizli değişkeninde).
+# Gizli değişkenler: IOS_SIGNING (Apple API anahtarı + dağıtım sertifikası, base64 JSON), PAKET_PAROLA. Kayıtlarda maskelenir.
+# Yalnız elle başlatılır (workflow_dispatch); kopyalar (fork) gizli değişkenlere erişemez.
+name: iOS derle
+on:
+  workflow_dispatch:
+    inputs:
+      surum:
+        description: "Şifreli paketin bulunduğu sürüm etiketi"
+        required: true
+      dosya:
+        description: "Şifreli paketin adı"
+        required: true
+        default: "paket.enc"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Paketi indir ve şifresini çöz
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAKET_PAROLA: ${{ secrets.PAKET_PAROLA }}
+        run: |
+          if [ -z "$PAKET_PAROLA" ]; then echo "PAKET_PAROLA yok"; exit 1; fi
+          gh release download "${{ inputs.surum }}" -p "${{ inputs.dosya }}" -D "$RUNNER_TEMP" -R "${{ github.repository }}"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in "$RUNNER_TEMP/${{ inputs.dosya }}" -out "$RUNNER_TEMP/paket.zip" -pass env:PAKET_PAROLA
+          rm "$RUNNER_TEMP/${{ inputs.dosya }}"
+          mkdir -p "$RUNNER_TEMP/xc" && cd "$RUNNER_TEMP/xc" && unzip -q "$RUNNER_TEMP/paket.zip" && rm "$RUNNER_TEMP/paket.zip"
+          find "$RUNNER_TEMP/xc" -type f \( -name "*.sh" -o -path "*/deploy_*/*" -o -name "MapFileParser*" -o -path "*/Tools/*" \) -exec chmod +x {} +
+          test -f "$RUNNER_TEMP/xc/_imza/profil.mobileprovision"
+          xcodebuild -version
+      - name: İmza paketini aç
+        env:
+          IOS_SIGNING: ${{ secrets.IOS_SIGNING }}
+        run: |
+          if [ -z "$IOS_SIGNING" ]; then echo "IOS_SIGNING yok"; exit 1; fi
+          echo "$IOS_SIGNING" | base64 --decode > "$RUNNER_TEMP/imza.json"
+          for k in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64 APPLE_TEAM_ID DIST_P12_BASE64 DIST_P12_PASSWORD; do
+            v=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$RUNNER_TEMP/imza.json" "$k")
+            echo "::add-mask::$v"
+            echo "$k=$v" >> "$GITHUB_ENV"
+          done
+          rm "$RUNNER_TEMP/imza.json"
+      - name: Sertifika ve profil
+        run: |
+          KC="$RUNNER_TEMP/imza.keychain-db"; KCP="$(uuidgen)"
+          echo "$DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security create-keychain -p "$KCP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCP" "$KC"
+          security import "$RUNNER_TEMP/dist.p12" -P "$DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          rm "$RUNNER_TEMP/dist.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KCP" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          UUID=$(security cms -D -i "$RUNNER_TEMP/xc/_imza/profil.mobileprovision" | plutil -extract UUID raw -)
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$d"; cp "$RUNNER_TEMP/xc/_imza/profil.mobileprovision" "$d/$UUID.mobileprovision"
+          done
+      - name: Arşivle (imzalı)
+        run: |
+          cd "$RUNNER_TEMP/xc"
+          BN=$(cat _imza/derleme_no.txt 2>/dev/null || echo ${{ github.run_number }})
+          xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CURRENT_PROJECT_VERSION=$BN \
+            archive | tail -n 120
+          test -d "$RUNNER_TEMP/App.xcarchive"
+      - name: App Store Connect'e yükle
+        run: |
+          mkdir -p ~/private_keys
+          echo "$ASC_KEY_P8_BASE64" | base64 --decode > ~/private_keys/AuthKey_$ASC_KEY_ID.p8
+          PROFIL=$(security cms -D -i "$RUNNER_TEMP/xc/_imza/profil.mobileprovision" | plutil -extract Name raw -)
+          BID=$(cat "$RUNNER_TEMP/xc/_imza/bundle_id.txt")
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict><key>$BID</key><string>$PROFIL</string></dict>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -authenticationKeyPath ~/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" 2>&1 | tail -n 40
+      - name: Temizlik
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/imza.keychain-db" || true
+          rm -rf ~/private_keys "$RUNNER_TEMP/xc" || true
