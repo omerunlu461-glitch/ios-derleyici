@@ -60,11 +60,16 @@ jobs:
           for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
             mkdir -p "$d"; cp "$RUNNER_TEMP/xc/_imza/profil.mobileprovision" "$d/$UUID.mobileprovision"
           done
+      - name: CocoaPods (Google reklam kütüphaneleri)
+        run: |
+          cd "$RUNNER_TEMP/xc"
+          if [ -f Podfile ]; then pod --version; pod install --repo-update | tail -n 30; fi
       - name: Arşivle (imzalı)
         run: |
           cd "$RUNNER_TEMP/xc"
           BN=$(cat _imza/derleme_no.txt 2>/dev/null || echo ${{ github.run_number }})
-          xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+          if [ -d Unity-iPhone.xcworkspace ]; then KAYNAK="-workspace Unity-iPhone.xcworkspace"; else KAYNAK="-project Unity-iPhone.xcodeproj"; fi
+          xcodebuild $KAYNAK -scheme Unity-iPhone -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
             CURRENT_PROJECT_VERSION=$BN \
             archive | tail -n 120
